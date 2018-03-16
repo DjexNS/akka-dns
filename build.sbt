@@ -3,6 +3,7 @@ organization := "ru.smslv.akka"
 name := "akka-dns"
 
 version := "2.4.2"
+isSnapshot := true
 
 scalaVersion := "2.12.4"
 

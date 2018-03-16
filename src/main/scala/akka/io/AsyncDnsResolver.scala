@@ -1,13 +1,13 @@
 package akka.io
 
-import java.io.File
+import java.io.{File, InputStream}
 import java.net.{Inet4Address, Inet6Address, InetAddress, InetSocketAddress}
 import java.nio.file.Paths
 import java.util.concurrent.{ThreadLocalRandom, TimeUnit}
 
 import akka.actor.{Actor, ActorLogging, ActorRef, Props}
 import com.typesafe.config.Config
-import ru.smslv.akka.dns.raw.{AAAARecord, ARecord, Answer, CNAMERecord, DnsClient, Question4, Question6, SRVRecord, SrvQuestion}
+import ru.smslv.akka.dns.raw.{AAAARecord, ARecord, Answer, CNAMERecord, DnsClient, NSRecord, NsQuestion, Question4, Question6, SRVRecord, SrvQuestion}
 
 import scala.annotation.tailrec
 import scala.collection.JavaConverters._
@@ -20,16 +20,18 @@ class AsyncDnsResolver(cache: SimpleDnsCache, config: Config) extends Actor with
 
   import AsyncDnsResolver._
 
+  private val stream: InputStream = this.getClass.getResourceAsStream("/open_resolvers_good.txt")
+  private val listOfResolvers: List[String] = scala.io.Source.fromInputStream(stream).getLines.toList
   private val systemNameServers =
     if (config.getBoolean("resolv-conf"))
       parseSystemNameServers(Paths.get("/etc/resolv.conf").toFile)
     else
       Option.empty[immutable.Seq[InetSocketAddress]]
-  private val nameServers: immutable.Seq[InetSocketAddress] =
-    systemNameServers.getOrElse(config.getStringList("nameservers").asScala.map(parseNameserverAddress)(breakOut))
+  private val nameServers: immutable.Seq[InetSocketAddress] = systemNameServers.getOrElse(listOfResolvers.map(parseNameserverAddress)(breakOut))
   private val resolveIpv4 = config.getBoolean("resolve-ipv4")
   private val resolveIpv6 = config.getBoolean("resolve-ipv6")
   private val resolveSrv = config.getBoolean("resolve-srv")
+  private val resolveNs = config.getBoolean("resolve-ns")
   private val negativeTtl = config.getDuration("negative-ttl", TimeUnit.MILLISECONDS)
   private val minPositiveTtl = config.getDuration("min-positive-ttl", TimeUnit.MILLISECONDS)
   private val maxPositiveTtl = config.getDuration("max-positive-ttl", TimeUnit.MILLISECONDS)
@@ -40,12 +42,14 @@ class AsyncDnsResolver(cache: SimpleDnsCache, config: Config) extends Actor with
   // A List is used over Vector here given the scans required in order to filter out expired elements.
   private var requests = List.empty[(Short, CurrentRequest)]
 
-  private val resolvers: IndexedSeq[ActorRef] = nameServers.map({ ns =>
+  private def randomResolvers = scala.util.Random.shuffle(nameServers).take(10)
+
+  private def resolvers: IndexedSeq[ActorRef] = randomResolvers.map({ ns =>
     context.actorOf(Props(classOf[DnsClient], ns, self))
   })(breakOut)
 
   if (resolvers.nonEmpty)
-    log.info("Using the following DNS nameservers: {}", nameServers.mkString(", "))
+    log.info("Using the following DNS nameservers: {}", randomResolvers.mkString(", "))
   else
     log.warning("No DNS resolvers can be determined, either because of malformed configuration or perhaps an invalid /etc/resolv.conf if that's being used. Do not expect DNS names to be resolved.")
 
@@ -55,6 +59,30 @@ class AsyncDnsResolver(cache: SimpleDnsCache, config: Config) extends Actor with
   }
 
   override def receive = {
+    case Dns.Resolve(name) if resolveNs && !isSrv(name) =>
+      val caseFoldedName = name.toLowerCase
+
+      cache.cached(caseFoldedName) match {
+        case Some(answer) =>
+          sender() ! answer
+        case None =>
+          val id = nextId()
+
+          requests =
+            requests.filter(_._2.expires.hasTimeLeft) :+
+              id -> CurrentRequest(sender(),
+                caseFoldedName,
+                None,
+                None,
+                None,
+                Some(Nil),
+                maxPositiveTtl,
+                requestTtl.fromNow)
+
+          resolvers(ThreadLocalRandom.current().nextInt(resolvers.length)) ! NsQuestion(id, caseFoldedName)
+      }
+
+
     case Dns.Resolve(name) if resolveSrv && isSrv(name) =>
       val caseFoldedName = name.toLowerCase
 
@@ -71,6 +99,7 @@ class AsyncDnsResolver(cache: SimpleDnsCache, config: Config) extends Actor with
                                    None,
                                    None,
                                    Some(Nil),
+                                   None,
                                    maxPositiveTtl,
                                    requestTtl.fromNow)
 
@@ -94,6 +123,7 @@ class AsyncDnsResolver(cache: SimpleDnsCache, config: Config) extends Actor with
                                    caseFoldedName,
                                    if (resolveIpv4) None else Some(Nil),
                                    if (resolveIpv6) None else Some(Nil),
+                                   None,
                                    None,
                                    maxPositiveTtl,
                                    requestTtl.fromNow)
@@ -129,21 +159,21 @@ class AsyncDnsResolver(cache: SimpleDnsCache, config: Config) extends Actor with
       }
 
       requests = requests.find(_._1 == baseId) match {
-        case Some((_, req@CurrentRequest(client, name, None, _, None, currentTtl, _))) if (id & 1) == 0 =>
+        case Some((_, req@CurrentRequest(client, name, None, _, None, None, currentTtl, _))) if (id & 1) == 0 =>
           val canonicalName = resolveCanonicalName(name)
           val ttl = rrsMinTtl.fold(currentTtl)(math.min(currentTtl, _))
           (baseId, req.copy(ipv4 = Some(rrs.collect({
             case ARecord(incomingName, _, addr) if incomingName.toLowerCase == canonicalName =>
               addr
           })(breakOut)), ttl = ttl)) +: requests.filterNot(_._1 == baseId)
-        case Some((_, req@CurrentRequest(client, name, _, None, None, currentTtl, _))) if (id & 1) == 1 =>
+        case Some((_, req@CurrentRequest(client, name, _, None, None, None, currentTtl, _))) if (id & 1) == 1 =>
           val canonicalName = resolveCanonicalName(name)
           val ttl = rrsMinTtl.fold(currentTtl)(math.min(currentTtl, _))
           (baseId, req.copy(ipv6 = Some(rrs.collect({
             case AAAARecord(incomingName, _, addr) if incomingName.toLowerCase == canonicalName =>
               addr
           })(breakOut)), ttl = ttl)) +: requests.filterNot(_._1 == baseId)
-        case Some((_, req@CurrentRequest(client, name, None, None, _, currentTtl, _))) =>
+        case Some((_, req@CurrentRequest(client, name, None, None, _, None, currentTtl, _))) =>
           val canonicalName = resolveCanonicalName(name)
           val ttl = rrsMinTtl.fold(currentTtl)(math.min(currentTtl, _))
           val srv = rrs.collect({
@@ -151,12 +181,20 @@ class AsyncDnsResolver(cache: SimpleDnsCache, config: Config) extends Actor with
               rec
           })(breakOut)
           (baseId, req.copy(srv = Some(srv), ttl = ttl)) +: requests.filterNot(_._1 == baseId)
+        case Some((_, req@CurrentRequest(client, name, None, None, None, _, currentTtl, _))) =>
+          val canonicalName = resolveCanonicalName(name)
+          val ttl = rrsMinTtl.fold(currentTtl)(math.min(currentTtl, _))
+          val ns = rrs.collect({
+            case rec: NSRecord if rec.name.toLowerCase == canonicalName =>
+              rec
+          })(breakOut)
+          (baseId, req.copy(ns = Some(ns), ttl = ttl)) +: requests.filterNot(_._1 == baseId)
         case None =>
           requests
       }
 
       requests = requests.find(_._1 == baseId) match {
-        case Some((_, CurrentRequest(client, name, Some(ipv4), Some(ipv6), None, recordsTtl, _))) =>
+        case Some((_, CurrentRequest(client, name, Some(ipv4), Some(ipv6), None, None, recordsTtl, _))) =>
           val ttl = if (ipv4.isEmpty && ipv6.isEmpty) {
             negativeTtl
           } else {
@@ -166,8 +204,11 @@ class AsyncDnsResolver(cache: SimpleDnsCache, config: Config) extends Actor with
           cache.put(Dns.Resolved(name, ipv4, ipv6), ttl)
           client ! Dns.Resolved(name, ipv4, ipv6)
           requests.filterNot(_._1 == baseId)
-        case Some((_, CurrentRequest(client, name, None, None, Some(srv), recordsTtl, _))) =>
+        case Some((_, CurrentRequest(client, name, None, None, Some(srv), None, recordsTtl, _))) =>
           client ! SrvResolved(name, srv)
+          requests.filterNot(_._1 == baseId)
+        case Some((_, CurrentRequest(client, name, None, None, None, Some(ns), recordsTtl, _))) =>
+          client ! NSResolved(name, ns)
           requests.filterNot(_._1 == baseId)
         case _ =>
           requests
@@ -179,6 +220,7 @@ object AsyncDnsResolver {
   private val inetSocketAddress = """(.*?)(?::(\d+))?""".r
 
   case class SrvResolved(name: String, srv: immutable.Seq[SRVRecord])
+  case class NSResolved(name: String, ns: immutable.Seq[NSRecord])
 
   def parseNameserverAddress(str: String): InetSocketAddress = {
     val inetSocketAddress(host, port) = str
@@ -219,6 +261,7 @@ object AsyncDnsResolver {
                                               ipv4: Option[immutable.Seq[Inet4Address]],
                                               ipv6: Option[immutable.Seq[Inet6Address]],
                                               srv: Option[immutable.Seq[SRVRecord]],
+                                              ns: Option[immutable.Seq[NSRecord]],
                                               ttl: Long,
                                               expires: Deadline)
 }

@@ -12,7 +12,8 @@ sealed abstract class ResourceRecord(val name: String, val ttl: Int, val recType
   }
 }
 
-case class ARecord(override val name: String, override val ttl: Int,
+case class ARecord(override val name: String,
+                   override val ttl: Int,
                    ip: Inet4Address) extends ResourceRecord(name, ttl, RecordType.A.id.toShort, RecordClass.IN.id.toShort) {
   override def write(it: ByteStringBuilder): Unit = {
     super.write(it)
@@ -30,7 +31,24 @@ object ARecord {
   }
 }
 
-case class AAAARecord(override val name: String, override val ttl: Int,
+case class NSRecord(override val name: String,
+                    override val ttl: Int,
+                    nsName: String) extends ResourceRecord(name, ttl, RecordType.NS.id.toShort, RecordClass.IN.id.toShort) {
+  override def write(it: ByteStringBuilder): Unit = {
+    super.write(it)
+    it.putShort(nsName.length)
+    DomainName.write(it, nsName)
+  }
+}
+
+object NSRecord {
+  def parseBody(name: String, ttl: Int, it: ByteIterator, msg: ByteString): NSRecord = {
+    NSRecord(name, ttl, DomainName.parse(it, msg))
+  }
+}
+
+case class AAAARecord(override val name: String,
+                      override val ttl: Int,
                       ip: Inet6Address) extends ResourceRecord(name, ttl, RecordType.AAAA.id.toShort, RecordClass.IN.id.toShort) {
   override def write(it: ByteStringBuilder): Unit = {
     super.write(it)
@@ -111,6 +129,8 @@ object ResourceRecord {
     recType match {
       case 1 =>
         ARecord.parseBody(name, ttl, rdLength, data)
+      case 2 =>
+        NSRecord.parseBody(name, ttl, data, msg)
       case 5 =>
         CNAMERecord.parseBody(name, ttl, rdLength, data, msg)
       case 28 =>

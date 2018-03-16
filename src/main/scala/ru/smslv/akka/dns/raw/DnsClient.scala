@@ -1,6 +1,5 @@
 package ru.smslv.akka.dns.raw
 
-
 import java.net.{InetAddress, InetSocketAddress}
 
 import akka.actor.{Actor, ActorLogging, ActorRef, Stash}
@@ -20,6 +19,8 @@ class DnsClient(ns: InetSocketAddress, upstream: ActorRef) extends Actor with Ac
     case r: Question4 =>
       stash()
     case r: Question6 =>
+      stash()
+    case r: NsQuestion =>
       stash()
     case r: SrvQuestion =>
       stash()
@@ -46,6 +47,16 @@ class DnsClient(ns: InetSocketAddress, upstream: ActorRef) extends Actor with Ac
           ))
         log.debug(s"Message to $ns: $msg6")
         socket ! Udp.Send(msg6.write(), ns)
+
+      case NsQuestion(id, name) =>
+        log.debug(s"Resolving $name (NS)")
+        val msg = Message(id,
+          MessageFlags(authoritativeAnswer = true, recursionDesired = true),
+          Seq(
+            Question(name, RecordType.NS, RecordClass.IN)
+          ))
+        log.debug(s"Message to $ns: $msg")
+        socket ! Udp.Send(msg.write(), ns)
 
       case SrvQuestion(id, name) =>
         log.debug(s"Resolving $name (SRV)")
@@ -74,6 +85,8 @@ class DnsClient(ns: InetSocketAddress, upstream: ActorRef) extends Actor with Ac
 }
 
 case class SrvQuestion(id: Short, name: String)
+
+case class NsQuestion(id: Short, name: String)
 
 case class Question4(id: Short, name: String)
 
